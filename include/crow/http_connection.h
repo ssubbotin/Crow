@@ -467,8 +467,8 @@ namespace crow
             // closed by the deadline while chunks are still on their way.
             cancel_deadline_timer();
 
-            // do_write_sync() clears the response on every write, so the provider has to be
-            // taken out of it before the loop starts.
+            // The provider is taken out of the response so that it survives any bookkeeping
+            // done on the response while the body is being written.
             auto provider = std::move(res.chunk_provider_);
             res.chunk_provider_ = nullptr;
 
@@ -490,7 +490,7 @@ namespace crow
                 buffers[0] = asio::const_buffer(chunk_header.data(), chunk_header.size());
                 buffers[1] = asio::const_buffer(chunk.data(), chunk.size());
                 buffers[2] = asio::const_buffer(crlf.data(), crlf.size());
-                ec = do_write_sync(buffers);
+                asio::write(adaptor_.socket(), buffers, ec);
                 if (ec)
                 {
                     CROW_LOG_ERROR << ec << " - buffer write error happened while sending a chunk. Writing stopped premature.";
@@ -502,7 +502,7 @@ namespace crow
                 static const std::string last_chunk = "0\r\n\r\n";
                 std::vector<asio::const_buffer> tail{1};
                 tail[0] = asio::const_buffer(last_chunk.data(), last_chunk.size());
-                ec = do_write_sync(tail);
+                asio::write(adaptor_.socket(), tail, ec);
                 if (ec)
                 {
                     CROW_LOG_ERROR << ec << " - buffer write error happened while sending the last chunk.";
