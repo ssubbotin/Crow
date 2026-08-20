@@ -1,4 +1,5 @@
 #pragma once
+#include <exception>
 #include <string>
 #include <unordered_map>
 #include <ios>
@@ -35,6 +36,14 @@ namespace crow
 
     class Router;
 
+    /// Outcome of a single chunk provider invocation.
+    enum class chunk_result
+    {
+        more, ///< The chunk is valid and more data is coming.
+        done, ///< The chunk is valid and it is the last one; the terminating frame is sent.
+        abort ///< The body cannot be finished; the connection is closed without the terminating frame.
+    };
+
     /// HTTP response
     struct response
     {
@@ -46,6 +55,15 @@ namespace crow
 
         friend class Router;
 
+    private:
+        enum class body_source_kind
+        {
+            none,
+            synchronous_chunked,
+            asynchronous_chunked
+        };
+
+    public:
         int code{200};    ///< The Status code for the response.
         std::string body; ///< The actual payload containing the response data.
         ci_map headers;   ///< HTTP headers.
@@ -55,6 +73,50 @@ namespace crow
 #endif
         bool skip_body = false;            ///< Whether this is a response to a HEAD request.
         bool manual_length_header = false; ///< Whether Crow should automatically add a "Content-Length" header.
+
+        /// Provider of the response body, called repeatedly until it returns false.
+
+        ///
+        /// The provider fills the given string with the next chunk of the body and returns
+        /// `true` while more data is coming, `false` on its last invocation. Leaving the
+        /// string empty is allowed as an occasional occurrence and sends no chunk; a provider
+        /// that has no data yet should block until data is available (or finish), since
+        /// returning empty chunks in a tight loop spins the connection thread needlessly.
+        using chunk_provider_t = std::function<bool(std::string&)>;
+
+        /// Outcome of a single chunk provider invocation; see crow::chunk_result.
+        using chunk_result = crow::chunk_result;
+
+        /// Provider of the response body, called repeatedly until it returns `done` or `abort`.
+
+        ///
+        /// The provider fills the given string with the next chunk of the body and returns
+        /// a chunk_result describing how to proceed. Leaving the string empty is allowed
+        /// as an occasional occurrence and sends no chunk; a provider that has no data yet
+        /// should block until data is available (or return `done`/`abort`), since returning
+        /// `more` with empty chunks in a tight loop spins the connection thread needlessly.
+        using chunk_provider_ex_t = std::function<chunk_result(std::string&)>;
+
+        /// Completion callback for one asynchronous chunk provider invocation.
+
+        ///
+        /// Returns `true` when Crow accepts the result for publication on the
+        /// connection executor. Returns `false` for inactive or repeated results and
+        /// when publication fails. A provider may use a `false` result to stop its
+        /// source after attempting to publish `chunk_result::more`.
+        using async_chunk_completion_t = std::function<bool(chunk_result result, std::string chunk)>;
+
+        /// Provider that asynchronously supplies one response body chunk per invocation.
+        using async_chunk_provider_t = std::function<void(async_chunk_completion_t complete)>;
+
+        /// Handler called once after the chunked body has been written (or writing has stopped).
+
+        ///
+        /// `clean` is `true` when the provider finished normally and every write succeeded.
+        /// It is `false` after a provider abort or exception, publication failure, downstream
+        /// peer closure, read failure or unexpected cancellation, retained-input overflow
+        /// before terminal completion, write failure or cancellation, or server shutdown.
+        using chunk_complete_t = std::function<void(bool clean)>;
 
         /// Set the value of an existing header in the response.
         void set_header(std::string key, std::string value)
@@ -183,6 +245,21 @@ namespace crow
             headers = std::move(r.headers);
             completed_ = r.completed_;
             file_info = std::move(r.file_info);
+#ifdef CROW_ENABLE_COMPRESSION
+            compressed = r.compressed;
+#endif
+            // skip_body is deliberately not copied: it marks the request side (the router
+            // sets it on the connection's response before the handler runs for a HEAD
+            // request), so a handler assigning a freshly built response must not reset it.
+            manual_length_header = r.manual_length_header;
+            chunk_provider_ex_ = std::move(r.chunk_provider_ex_);
+            async_chunk_provider_ = std::move(r.async_chunk_provider_);
+            chunk_complete_ = std::move(r.chunk_complete_);
+            body_source_ = r.body_source_;
+            r.chunk_provider_ex_    = nullptr;
+            r.async_chunk_provider_ = nullptr;
+            r.chunk_complete_       = nullptr;
+            r.body_source_ = body_source_kind::none;
             return *this;
         }
 
@@ -199,6 +276,11 @@ namespace crow
             headers.clear();
             completed_ = false;
             file_info = static_file_info{};
+            chunk_provider_ex_ = nullptr;
+            async_chunk_provider_ = nullptr;
+            chunk_complete_ = nullptr;
+            body_source_ = body_source_kind::none;
+            manual_length_header = false;
         }
 
         /// Return a "Temporary Redirect" response.
@@ -254,15 +336,36 @@ namespace crow
                 completed_ = true;
                 if (skip_body)
                 {
-                    set_header("Content-Length", std::to_string(body.size()));
-                    body = "";
-                    manual_length_header = true;
+                    if (is_chunked_type())
+                    {
+                        // HEAD keeps "Transfer-Encoding: chunked" and omits "Content-Length".
+                        // The connection invokes completion after checking the HTTP version.
+                        chunk_provider_ex_ = nullptr;
+                        async_chunk_provider_ = nullptr;
+                        body = "";
+                        manual_length_header = true;
+                        if (!complete_request_handler_ && !is_alive_helper_)
+                        {
+                            notify_chunked_completion(true);
+                        }
+                    }
+                    else
+                    {
+                        if (!is_static_type() && !body.empty())
+                        {
+                            set_header("Content-Length", std::to_string(body.size()));
+                            manual_length_header = true;
+                        }
+                        body = "";
+                        if (is_static_type())
+                        {
+                            manual_length_header = true;
+                        }
+                    }
                 }
                 if (complete_request_handler_)
                 {
                     complete_request_handler_();
-                    manual_length_header = false;
-                    skip_body = false;
                 }
             }
         }
@@ -284,6 +387,98 @@ namespace crow
         bool is_static_type()
         {
             return file_info.path.size();
+        }
+
+        /// Check whether the response body is produced by a chunk provider.
+        bool is_chunked_type() const
+        {
+            return body_source_ != body_source_kind::none;
+        }
+
+        /// Send the response body in chunks produced on demand, without holding it in memory.
+
+        ///
+        /// The body is sent using `Transfer-Encoding: chunked`, so its size need not be known
+        /// in advance, which makes it suitable for bodies of arbitrary or unknown length. The
+        /// provider runs on the connection thread while the response is being written. The
+        /// provider should not throw: an exception that escapes it is logged and treated as
+        /// an abort (the connection is closed without the terminating frame).
+        void set_chunked_content_provider(chunk_provider_t provider, std::string content_type = "")
+        {
+            set_chunked_content_provider(
+              [provider = std::move(provider)](std::string& chunk) {
+                  return provider(chunk) ? chunk_result::more : chunk_result::done;
+              },
+              std::move(content_type));
+        }
+
+        /// Send the response body in chunks produced on demand, without holding it in memory.
+
+        ///
+        /// Same as the `chunk_provider_t` overload, except that the provider can also return
+        /// `chunk_result::abort` to close the connection without the terminating frame, so
+        /// that the client sees a truncated body instead of a seemingly complete one.
+        /// Any previously set "Content-Length" header is removed: chunked transfer encoding
+        /// and "Content-Length" must not be sent together. A previously configured static
+        /// file or string body is discarded for the same reason: a response has exactly one
+        /// body source, and the one configured last wins.
+        void set_chunked_content_provider(chunk_provider_ex_t provider, std::string content_type = "")
+        {
+            chunk_provider_ex_ = std::move(provider);
+            async_chunk_provider_ = nullptr;
+            body_source_ = body_source_kind::synchronous_chunked;
+            file_info             = static_file_info{};
+            body.clear();
+            manual_length_header = true;
+            headers.erase("Content-Length");
+            set_header("Transfer-Encoding", "chunked");
+            if (!content_type.empty()) {
+                set_header("Content-Type", std::move(content_type));
+            }
+        }
+
+        /// Send response body chunks supplied asynchronously without holding the body in memory.
+
+        ///
+        /// Crow invokes the provider once for each requested chunk. The provider must return
+        /// promptly and invoke its completion callback exactly once with `more`, `done`, or
+        /// `abort`, either before or after it returns. The callback may be invoked from any
+        /// thread; Crow posts the result to the connection executor. The next chunk is not
+        /// requested until the preceding chunk has been written. An exception from the provider
+        /// is treated as `abort`. Installing this provider discards a string body, static file,
+        /// or synchronous chunk provider that was configured earlier. An empty provider still
+        /// selects asynchronous streaming; Crow treats its invocation as an abort, closes the
+        /// connection without a terminating frame, and reports unclean completion once.
+        void set_async_chunked_content_provider(async_chunk_provider_t provider, std::string content_type = "") {
+            async_chunk_provider_ = std::move(provider);
+            chunk_provider_ex_    = nullptr;
+            body_source_ = body_source_kind::asynchronous_chunked;
+            file_info = static_file_info{};
+            body.clear();
+            manual_length_header = true;
+            headers.erase("Content-Length");
+            set_header("Transfer-Encoding", "chunked");
+            if (!content_type.empty())
+            {
+                set_header("Content-Type", std::move(content_type));
+            }
+        }
+
+        /// Set a handler called once after the chunked body has been written (or writing has stopped).
+
+        ///
+        /// The handler runs exactly once. Its `clean` argument is `true` when the provider
+        /// finished normally (`chunk_result::done`, or `false` from the `chunk_provider_t`
+        /// overload) and every write succeeded. It is `false` after `abort`, a provider
+        /// exception, a write error, or shutdown during an active asynchronous transfer. Normal
+        /// completion and server worker shutdown invoke it on the connection thread. For a HEAD
+        /// request the body is skipped and the provider is never called, but the handler still
+        /// runs with `clean == true`. An HTTP/1.0 request rejects either kind of provider before
+        /// invocation and runs the handler with `clean == false`. The handler should not throw:
+        /// an exception that escapes it is logged and swallowed.
+        void set_chunked_completion_handler(chunk_complete_t handler)
+        {
+            chunk_complete_ = std::move(handler);
         }
 
         /// This constains metadata (coming from the `stat` command) related to any static files associated with this response.
@@ -308,6 +503,16 @@ namespace crow
         /// the content_type may be specified explicitly.
         void set_static_file_info_unsafe(std::string path, std::string content_type = "")
         {
+            // A response has exactly one body source: installing the file drops a
+            // previously configured chunk provider together with its framing header,
+            // otherwise "Transfer-Encoding: chunked" and "Content-Length" would be
+            // sent side by side while the raw file bytes go out unframed.
+            chunk_provider_ex_ = nullptr;
+            async_chunk_provider_ = nullptr;
+            chunk_complete_ = nullptr;
+            body_source_ = body_source_kind::none;
+            headers.erase("Transfer-Encoding");
+            manual_length_header = false;
             file_info.path = path;
             file_info.statResult = stat(file_info.path.c_str(), &file_info.statbuf);
 #ifdef CROW_ENABLE_COMPRESSION
@@ -392,9 +597,10 @@ namespace crow
               {status::BAD_GATEWAY, "HTTP/1.1 502 Bad Gateway\r\n"},
               {status::SERVICE_UNAVAILABLE, "HTTP/1.1 503 Service Unavailable\r\n"},
               {status::GATEWAY_TIMEOUT, "HTTP/1.1 504 Gateway Timeout\r\n"},
+              {status::HTTP_VERSION_NOT_SUPPORTED, "HTTP/1.1 505 HTTP Version Not Supported\r\n"},
               {status::VARIANT_ALSO_NEGOTIATES, "HTTP/1.1 506 Variant Also Negotiates\r\n"},
-              {status::WEBDAV_INSUFFICIENT_STORAGE,  "HTTP/1.1 507 Insufficient Storage\r\n"},
-              };
+              {status::WEBDAV_INSUFFICIENT_STORAGE, "HTTP/1.1 507 Insufficient Storage\r\n"},
+            };
 
             static const std::string seperator = ": ";
 
@@ -460,5 +666,34 @@ namespace crow
         std::function<void()> complete_request_handler_;
         std::function<bool()> is_alive_helper_;
         static_file_info file_info;
+        chunk_provider_ex_t chunk_provider_ex_;
+        async_chunk_provider_t async_chunk_provider_;
+        chunk_complete_t chunk_complete_;
+
+    private:
+        void notify_chunked_completion(bool clean) noexcept
+        {
+            auto completion_handler = std::move(chunk_complete_);
+            chunk_complete_ = nullptr;
+            if (!completion_handler)
+            {
+                return;
+            }
+
+            try
+            {
+                completion_handler(clean);
+            }
+            catch (const std::exception& e)
+            {
+                CROW_LOG_ERROR << "An uncaught exception occurred in the chunked completion handler: " << e.what();
+            }
+            catch (...)
+            {
+                CROW_LOG_ERROR << "An uncaught exception occurred in the chunked completion handler.";
+            }
+        }
+
+        body_source_kind body_source_{body_source_kind::none};
     };
 } // namespace crow

@@ -1611,6 +1611,7 @@ namespace crow // NOTE: Already documented in "crow/app.h"
         std::unique_ptr<routing_handle_result> handle_initial(request& req, response& res)
         {
             HTTPMethod method_actual = req.method;
+            res.skip_body = req.method == HTTPMethod::Head;
 
             std::unique_ptr<routing_handle_result> found{
               new routing_handle_result(
@@ -1639,7 +1640,6 @@ namespace crow // NOTE: Already documented in "crow/app.h"
                     }
                 }
 
-                res.skip_body = true;
                 found->method = method_actual;
                 return found;
             }
